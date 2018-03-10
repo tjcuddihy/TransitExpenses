@@ -1,0 +1,120 @@
+library(shiny)
+suppressPackageStartupMessages(library(data.table))
+suppressPackageStartupMessages(library(xlsx))
+
+submissionTemplate <- './Mass Transit - Canada.xlsx'
+# submissionFile <- loadWorkbook(submissionTemplate)
+# sheet <- getSheets(submissionFile)
+# rows <- getRows(sheet[[1]])
+# cells <- getCells(rows)
+# values <- lapply(cells, getCellValue)
+
+createXLSX <- function(compassDataTable, input, filename) {
+  compass <- copy(compassDataTable())
+  
+  # Load template file
+  submissionFile <- loadWorkbook(submissionTemplate)
+  sheet <- getSheets(submissionFile)
+  rows <- getRows(sheet[[1]])
+  cells <- getCells(rows)
+  values <- lapply(cells, getCellValue)
+  
+  suppressWarnings(compass[,DateTime := as.POSIXct(strptime(DateTime, format = "%b-%d-%Y %I:%M %p"))])
+  morning_commute <- input$morning
+  evening_commute <- input$evening
+  validate(
+    need(length(morning_commute) == 2, label = 'Morning not length == 2'),
+    need(length(evening_commute) == 2, label = 'Morning not length == 2')
+  )
+  compass[,weekday := as.integer(format(DateTime, format = "%u"))]
+  compass[,hour := as.numeric(hour(DateTime) + minute(DateTime)/60)]
+  compass <- compass[!grepl('Auto|Purchase', Transaction),]
+  compass <- compass[weekday %in% seq(1:5)][hour %between% morning_commute | hour %between% evening_commute]
+  compass[, Amount := as.numeric(gsub(pattern = "\\(|\\)|\\$", replacement = "", x = Amount))]
+  ##########
+  # Setup values to write into template.xlsx
+  writeCells <- c()
+  writeValues <- list()
+  
+  # Name
+  writeCells <- c(writeCells, names(which(values == '<Name>')))
+  writeValues <- append(writeValues, input$name)
+  
+  # Signature
+  writeCells <- c(writeCells, names(which(values == '<Signature>')))
+  writeValues <- append(writeValues, input$name)
+  
+  # Date of Signature
+  writeCells <- c(writeCells, names(which(values == '<SignDate>')))
+  writeValues <- append(writeValues, format(Sys.Date(), '%Y-%b-%d'))
+  
+  # Date of final expense
+  writeCells <- c(writeCells, names(which(values == '<FinalTripDate>')))
+  writeValues <- append(writeValues, format(compass[1, DateTime], format = '%Y-%b-%d'))
+  
+  # Refund amount
+  writeCells <- c(writeCells, names(which(values == '<RefundAmount>')))
+  writeValues <- append(writeValues, round(abs(sum(compass$Amount))/2, 4))
+  
+  # Explanation
+  writeCells <- c(writeCells, names(which(values == '<Explanation>')))
+  writeValues <- append(writeValues, sprintf('50%% of %.2f', abs(sum(compass$Amount))))
+  
+  # Remove now-useless columns and convert Dates to Character
+  compass[, c('weekday', 'hour') := NULL]
+  compass[,DateTime := as.character(format(DateTime, format = "%b-%d-%Y %I:%M %p"))]
+  # Add total
+  colPosition_Amount <- which(colnames(compass) == 'Amount')
+  # compass <- rbind(compass, list(' ',' ',' ','Total', abs(sum(compass$Amount))))
+  
+  compass <- rbind(compass, as.list(
+    c(rep(' ', colPosition_Amount - 2),'Total', abs(sum(compass$Amount)), rep(' ', ncol(compass) - colPosition_Amount))
+  ))
+  
+  invisible(mapply(setCellValue, cells[writeCells], writeValues))
+  compassData <- createSheet(submissionFile, 'Sheet2')
+  addDataFrame(x = compass, sheet = compassData, row.names = FALSE)
+  submissionFile$`setForceFormulaRecalculation`(TRUE)
+  saveWorkbook(submissionFile, file = filename)
+}
+
+server <- function(session, input, output) {
+  compassData <- reactive({
+    inFile <- input$compassCSV
+    if (is.null(inFile)) {
+      return(NULL)
+    }
+    data.table(read.csv(inFile$datapath, header = TRUE, stringsAsFactors = FALSE))
+  })
+  output$downloadData <- downloadHandler(
+    filename = function(){
+      data <- copy(compassData())
+      suppressWarnings(data[,DateTime := as.POSIXct(strptime(DateTime, format = "%b-%d-%Y %I:%M %p"))])
+      filename <- paste0(gsub(' ', '', input$name), '-', format(data$DateTime[1], format = "%Y-%B"),'.xlsx')
+      cat(paste(Sys.time(), filename), sep = '\n', file = 'log.txt', append = TRUE)
+      filename
+    },
+    content = function(file) {
+      createXLSX(compassDataTable = compassData,
+                 input = input, filename = file)
+    }
+  )
+}
+
+ui <- fluidPage(
+  h1('Compass trip log app.'),
+  textInput(inputId = 'name', label = 'Name', placeholder = 'Enter your Name'),
+  sliderInput(inputId = 'morning', label = 'Morning commute window',
+              min = 5, max = 11, value = c(7.5, 9), step = 0.25),
+  sliderInput(inputId = 'evening', label = 'Evening commute window',
+              min = 15, max = 22, value = c(15, 18), step = 0.25),
+  fileInput("compassCSV", "Choose CSV File",
+            accept = c(
+              "text/csv",
+              "text/comma-separated-values,text/plain",
+              ".csv")
+  ),
+  downloadButton('downloadData', 'Process')
+)
+
+shinyApp(ui = ui, server = server)
